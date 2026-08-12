@@ -1,5 +1,6 @@
 import io
 import os
+import re
 import secrets
 import streamlit as st
 import pandas as pd
@@ -9,7 +10,8 @@ from streamlit_js_eval import get_geolocation, streamlit_js_eval
 from database import (
     init_db, get_session, Student, Subject, Attendance,
     CaseTracker, Schedule, Justification, User, calculate_distance, ActaAsistencia,
-    QRAttendanceToken, QRAttendanceCheckin
+    QRAttendanceToken, QRAttendanceCheckin, CicloEscolar, Matricula,
+    hash_password, verify_password
 )
 from analytics import (
     evaluate_student_risk, get_institutional_semaphore, evaluate_student_risk_detailed,
@@ -426,6 +428,95 @@ h4, h5, h6 {
     100% { background-position: 0% 50%; }
 }
 
+/* =====================================================================
+   TARJETAS TECNOLÓGICAS (glassmorphism + borde con gradiente animado)
+   Usadas en las pantallas de selección de módulo / opciones por rol.
+   ===================================================================== */
+.nexus-tech-card-wrap {
+    position: relative;
+    border-radius: 18px;
+    padding: 2px;
+    background: linear-gradient(120deg, var(--nexus-navy), var(--nexus-gold), var(--nexus-navy-light), var(--nexus-gold));
+    background-size: 300% 300%;
+    animation: nexusGradientShift 6s ease infinite;
+    transition: transform 0.25s ease, box-shadow 0.25s ease;
+}
+.nexus-tech-card-wrap:hover {
+    transform: translateY(-6px) scale(1.012);
+    box-shadow: 0 16px 34px rgba(11, 31, 77, 0.28);
+}
+@keyframes nexusGradientShift {
+    0%   { background-position: 0% 50%; }
+    50%  { background-position: 100% 50%; }
+    100% { background-position: 0% 50%; }
+}
+
+.nexus-tech-card {
+    position: relative;
+    border-radius: 16px;
+    padding: 1.6rem 1.5rem 1.8rem 1.5rem;
+    background: rgba(255, 255, 255, 0.72);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    overflow: hidden;
+}
+.nexus-tech-card::after {
+    content: "";
+    position: absolute;
+    top: -40%; left: -40%;
+    width: 60%; height: 180%;
+    background: linear-gradient(120deg, transparent, rgba(201,151,46,0.18), transparent);
+    transform: rotate(20deg);
+    transition: left 0.6s ease;
+    pointer-events: none;
+}
+.nexus-tech-card-wrap:hover .nexus-tech-card::after {
+    left: 120%;
+}
+
+.nexus-tech-card-icon {
+    font-size: 2.4rem;
+    display: inline-block;
+    animation: nexusFloat 3s ease-in-out infinite;
+    filter: drop-shadow(0 4px 8px rgba(11,31,77,0.18));
+}
+@keyframes nexusFloat {
+    0%, 100% { transform: translateY(0px); }
+    50%      { transform: translateY(-6px); }
+}
+
+.nexus-tech-card-title {
+    font-family: 'Playfair Display', serif;
+    font-weight: 700;
+    font-size: 1.25rem;
+    color: var(--nexus-navy);
+    margin: 0.5rem 0 0.4rem 0;
+}
+.nexus-tech-card-desc {
+    color: #4a5a7a;
+    font-size: 0.92rem;
+    line-height: 1.4rem;
+}
+
+/* --- Tarjeta completa como enlace clicable (sin botón aparte) --- */
+a.nexus-tech-card-link {
+    text-decoration: none !important;
+    display: block;
+    cursor: pointer;
+}
+a.nexus-tech-card-link:hover .nexus-tech-card-arrow {
+    transform: translateX(6px);
+    opacity: 1;
+}
+.nexus-tech-card-arrow {
+    display: inline-block;
+    margin-top: 0.9rem;
+    font-weight: 700;
+    color: var(--nexus-gold);
+    opacity: 0.75;
+    transition: transform 0.25s ease, opacity 0.25s ease;
+}
+
 /* --- Expander --- */
 [data-testid="stExpander"] {
     border-radius: 10px !important;
@@ -440,11 +531,29 @@ hr { border-color: rgba(201, 151, 46, 0.35) !important; }
 """
 st.markdown(CSS_NEXUS, unsafe_allow_html=True)
 
-try:
+@st.cache_resource
+def _ejecutar_init_db_una_sola_vez():
+    """init_db() corre las migraciones (Base.metadata.create_all + varios ALTER TABLE
+    con commit/rollback) — son ~15-20 viajes de ida y vuelta a la base de datos. Sin
+    este cache, Streamlit las repetiría en CADA clic (porque re-ejecuta todo el script
+    en cada interacción), lo cual hacía que la app se sintiera muy lenta contra una
+    base de datos remota como Neon. @st.cache_resource garantiza que esta función se
+    ejecute una sola vez por proceso del servidor, sin importar cuántas reruns ocurran
+    después ni cuántos usuarios la usen a la vez."""
     init_db()
+    return True
+
+
+try:
+    _ejecutar_init_db_una_sola_vez()
     session = get_session()
 except Exception as e:
-    st.error(f"Error en la base de datos: {e}")
+    st.error(
+        "❌ No se pudo conectar con la base de datos. Esto puede ser temporal (el servidor de base de "
+        "datos puede estar 'despertando' tras un rato de inactividad) — espera unos segundos y recarga "
+        "la página. Si sigue pasando, avisa al administrador del sistema.")
+    with st.expander("Detalle técnico (para el administrador)"):
+        st.code(str(e))
     st.stop()
 
 # Manejo de Sesión / Estado
@@ -452,7 +561,8 @@ if 'user' not in st.session_state:
     st.session_state['user'] = None
 
 if 'admin_view' not in st.session_state:
-    st.session_state['admin_view'] = 'dashboard'  # Opciones: 'dashboard', 'horarios', 'asistencia'
+    st.session_state['admin_view'] = 'select_ciclo'  # Opciones: 'select_ciclo', 'dashboard', 'horarios', 'asistencia'
+
 
 # -----------------------------------------------------------------------------
 # AUTENTICACIÓN / LOGIN
@@ -460,7 +570,9 @@ if 'admin_view' not in st.session_state:
 if st.session_state['user'] is None:
     col_l1, col_l2, col_l3 = st.columns([1, 1.3, 1])
     with col_l2:
-        st.markdown('<div class="nexus-login-card">', unsafe_allow_html=True)
+        st.markdown('<div class="nexus-tech-card-wrap" style="margin-top:2.5rem;">'
+                    '<div class="nexus-tech-card" style="padding:2rem 2rem 1rem 2rem;">',
+                    unsafe_allow_html=True)
         if os.path.exists(LOGO_PATH):
             col_logo1, col_logo2, col_logo3 = st.columns([1, 1.4, 1])
             with col_logo2:
@@ -479,19 +591,24 @@ if st.session_state['user'] is None:
         password_input = st.text_input("Contraseña", type="password", key="login_pass_input")
 
         if st.button("Ingresar", type="primary", width='stretch', key="login_submit_btn"):
-            user_found = session.query(User).filter_by(username=username_input, password=password_input).first()
-            if user_found:
-                st.session_state['user'] = user_found
-                st.session_state['admin_view'] = 'dashboard'
-                st.success(f"Bienvenido {user_found.username} ({user_found.role})")
-                st.rerun()
-            else:
-                st.error("Usuario o contraseña incorrectos")
+            try:
+                user_found = session.query(User).filter_by(username=username_input).first()
+                if user_found and verify_password(password_input, user_found.password):
+                    st.session_state['user'] = user_found
+                    st.session_state['admin_view'] = 'select_ciclo'
+                    st.success(f"Bienvenido {user_found.username} ({user_found.role})")
+                    st.rerun()
+                else:
+                    st.error("Usuario o contraseña incorrectos")
+            except Exception:
+                st.error(
+                    "❌ No se pudo conectar con el sistema en este momento. Espera unos segundos y vuelve "
+                    "a intentar — si el problema sigue, avisa al administrador.")
 
         st.caption("🔒 **Credenciales de Prueba:**")
         st.caption(
             "- **Admin:** `admin` / `123` | **Docente Orientador:** `profe` / `123` | **Alumno:** `juan` / `123`")
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('</div></div>', unsafe_allow_html=True)
     st.stop()
 
 NEXUS_RIESGO_BADGE = {
@@ -526,6 +643,106 @@ def mostrar_skeleton(placeholder, n_lineas=5, titulo=None):
     )
     titulo_html = f'<div style="font-weight:600; color:#5a6b8c; margin-bottom:0.5rem;">{titulo}</div>' if titulo else ""
     placeholder.markdown(f'<div>{titulo_html}{lineas_html}</div>', unsafe_allow_html=True)
+
+
+class _CicloActivoCache:
+    """Objeto ligero (no un modelo de SQLAlchemy) para devolver el ciclo activo
+    cacheado, evitando reusar un objeto ORM que quedaría 'desconectado' de la
+    sesión de base de datos en la siguiente rerun."""
+    def __init__(self, id_, nombre):
+        self.id = id_
+        self.nombre = nombre
+
+
+def detectar_materia_actual_horarios(seccion_nombre):
+    """Consulta el módulo de Horarios (SQLite) para averiguar qué materia le
+    corresponde AHORA MISMO a una sección, según el día y la hora actuales.
+    Devuelve el nombre de la materia (str) o None si no hay clase activa en
+    este momento (recreo, almuerzo, fuera de horario, o sin horario cargado)."""
+    import sqlite3
+
+    dias_ingles = {'Monday': 'Lunes', 'Tuesday': 'Martes', 'Wednesday': 'Miércoles',
+                   'Thursday': 'Jueves', 'Friday': 'Viernes', 'Saturday': 'Sábado', 'Sunday': 'Domingo'}
+    ahora = datetime.now()
+    dia_actual_esp = dias_ingles.get(ahora.strftime('%A'), ahora.strftime('%A'))
+    hora_actual = ahora.time()
+
+    # Mismos bloques horarios que usa el módulo de Horarios (ver pestaña
+    # "Visualizar y Generar Horarios"), solo los bloques de clase (sin recesos).
+    medios_bloques_ref = [
+        {"id": 1, "ini": "07:00", "fin": "07:45"}, {"id": 2, "ini": "07:45", "fin": "08:30"},
+        {"id": 3, "ini": "08:40", "fin": "09:25"}, {"id": 4, "ini": "09:25", "fin": "10:10"},
+        {"id": 5, "ini": "10:20", "fin": "11:05"}, {"id": 6, "ini": "11:05", "fin": "11:50"},
+        {"id": 7, "ini": "13:00", "fin": "13:45"}, {"id": 8, "ini": "13:45", "fin": "14:30"},
+        {"id": 9, "ini": "14:40", "fin": "15:25"}, {"id": 10, "ini": "15:25", "fin": "16:10"},
+        {"id": 11, "ini": "16:20", "fin": "17:10"}, {"id": 12, "ini": "17:10", "fin": "17:50"},
+    ]
+    bloque_actual_id = None
+    for b in medios_bloques_ref:
+        h_ini = datetime.strptime(b["ini"], "%H:%M").time()
+        h_fin = datetime.strptime(b["fin"], "%H:%M").time()
+        if h_ini <= hora_actual <= h_fin:
+            bloque_actual_id = b["id"]
+            break
+
+    if bloque_actual_id is None:
+        return None
+
+    try:
+        conn_h = sqlite3.connect("modulo_horarios/database.db")
+        cursor_h = conn_h.cursor()
+        cursor_h.execute("SELECT id FROM seccion WHERE nombre = ?", (seccion_nombre,))
+        sec_res = cursor_h.fetchone()
+        if not sec_res:
+            conn_h.close()
+            return None
+
+        cursor_h.execute("""
+                         SELECT m.nombre
+                         FROM horario h
+                                  JOIN materia m ON h.materia_id = m.id
+                         WHERE h.seccion_id = ? AND h.dia = ? AND h.bloque_id = ?
+                         """, (sec_res[0], dia_actual_esp, bloque_actual_id))
+        res = cursor_h.fetchone()
+        conn_h.close()
+        return res[0] if res else None
+    except Exception:
+        return None
+
+
+def obtener_o_crear_subject_por_nombre(session, nombre_materia):
+    """Puente entre el módulo de Horarios (materias reales del pénsum, en
+    SQLite) y el módulo de Asistencia (tabla 'subjects' en Postgres). Si la
+    materia detectada todavía no existe del lado de Asistencia, se crea con
+    el mismo nombre para que ambos módulos queden sincronizados."""
+    materia_existente = session.query(Subject).filter_by(name=nombre_materia).first()
+    if materia_existente:
+        return materia_existente
+    nueva_materia = Subject(name=nombre_materia)
+    session.add(nueva_materia)
+    session.commit()
+    return nueva_materia
+
+
+def get_ciclo_activo(session):
+    """Devuelve el ciclo activo. Se cachea en st.session_state (solo id y nombre,
+    valores simples) porque esta función se llama varias veces por ejecución, y
+    cada consulta es un viaje de ida y vuelta a la base de datos remota (Neon).
+    El caché se invalida explícitamente en los 2 lugares donde el ciclo activo
+    puede cambiar (activar un ciclo existente, o crear uno nuevo)."""
+    if st.session_state.get('ciclo_activo_id') is not None:
+        return _CicloActivoCache(
+            st.session_state['ciclo_activo_id'], st.session_state['ciclo_activo_nombre'])
+
+    ciclo = session.query(CicloEscolar).filter_by(activo=True).first()
+    if not ciclo:
+        ciclo = CicloEscolar(nombre=str(date.today().year), activo=True)
+        session.add(ciclo)
+        session.commit()
+
+    st.session_state['ciclo_activo_id'] = ciclo.id
+    st.session_state['ciclo_activo_nombre'] = ciclo.nombre
+    return ciclo
 
 
 current_user = st.session_state['user']
@@ -563,7 +780,7 @@ with col_h1:
 with col_h2:
     if st.button("🚪 Cerrar Sesión", key="btn_logout_header"):
         st.session_state['user'] = None
-        st.session_state['admin_view'] = 'dashboard'
+        st.session_state['admin_view'] = 'select_ciclo'
         st.rerun()
 
 st.divider()
@@ -572,7 +789,7 @@ st.divider()
 # 1. PERFIL ALUMNO (GPS)
 # -----------------------------------------------------------------------------
 if current_user.role == "Alumno":
-    st.subheader("📍 Marcaje de Asistencia por Bloque (Geolocalizado)")
+    st.subheader("🎒 Mi Perfil")
     student_data = session.query(Student).filter_by(id=current_user.student_id).first()
     if not student_data:
         st.error("Registro de alumno no encontrado.")
@@ -644,30 +861,43 @@ if current_user.role == "Alumno":
                                 INSTITUTE_LAT, INSTITUTE_LON
                             )
                             if dist_qr <= MAX_DISTANCE_METERS:
-                                sub_id_qr = token_row_qr.subject_id if token_row_qr.subject_id else 1
-                                existing_att_qr = session.query(Attendance).filter_by(
-                                    student_id=student_data.id, subject_id=sub_id_qr, date=date.today()
-                                ).first()
+                                if not token_row_qr.subject_id:
+                                    st.error(
+                                        "❌ Este código QR no tiene una materia asociada (fue generado antes de "
+                                        "esta actualización). Pide a tu docente que genere uno nuevo.")
+                                    st.stop()
+                                try:
+                                    sub_id_qr = token_row_qr.subject_id
+                                    existing_att_qr = session.query(Attendance).filter_by(
+                                        student_id=student_data.id, subject_id=sub_id_qr, date=date.today()
+                                    ).first()
 
-                                if not existing_att_qr:
-                                    session.add(Attendance(
-                                        student_id=student_data.id,
-                                        subject_id=sub_id_qr,
-                                        date=date.today(),
-                                        status="Presente",
-                                        observation="Asistencia registrada vía QR"
+                                    if not existing_att_qr:
+                                        session.add(Attendance(
+                                            student_id=student_data.id,
+                                            subject_id=sub_id_qr,
+                                            date=date.today(),
+                                            status="Presente",
+                                            observation="Asistencia registrada vía QR",
+                                            ciclo_id=get_ciclo_activo(session).id
+                                        ))
+                                    else:
+                                        existing_att_qr.status = "Presente"
+                                        existing_att_qr.observation = "Asistencia registrada vía QR"
+
+                                    session.add(QRAttendanceCheckin(
+                                        token_id=token_row_qr.id, student_id=student_data.id
                                     ))
-                                else:
-                                    existing_att_qr.status = "Presente"
-                                    existing_att_qr.observation = "Asistencia registrada vía QR"
+                                    session.commit()
 
-                                session.add(QRAttendanceCheckin(
-                                    token_id=token_row_qr.id, student_id=student_data.id
-                                ))
-                                session.commit()
-
-                                st.balloons()
-                                st.success("🚀 ¡Asistencia registrada correctamente mediante el código QR!")
+                                    st.balloons()
+                                    st.success("🚀 ¡Asistencia registrada correctamente mediante el código QR!")
+                                except Exception:
+                                    session.rollback()
+                                    st.error(
+                                        "❌ No se pudo guardar tu asistencia por un problema de conexión con la "
+                                        "base de datos. Vuelve a escanear el código — si aún es válido, se "
+                                        "registrará sin problema.")
                             else:
                                 st.error(
                                     f"❌ Debes estar dentro del instituto para registrar tu asistencia por QR. "
@@ -676,196 +906,237 @@ if current_user.role == "Alumno":
                             st.warning("Por favor activa y concede el acceso a tu ubicación GPS en el navegador para completar el registro.")
         st.stop()
 
-    now = datetime.now()
-    dias_ingles = {'Monday': 'Lunes', 'Tuesday': 'Martes', 'Wednesday': 'Miércoles', 'Thursday': 'Jueves',
-                   'Friday': 'Viernes', 'Saturday': 'Sábado', 'Sunday': 'Domingo'}
-    current_day_eng = now.strftime('%A')
-    current_day_esp = dias_ingles.get(current_day_eng, current_day_eng)
-    current_time = now.time()
+    # =====================================================================
+    # PERFIL DEL ALUMNO (vista normal, sin llegar vía QR): ya NO se registra
+    # asistencia automáticamente por GPS al entrar — la única forma de marcar
+    # asistencia es escaneando el QR que genera el docente. Aquí el alumno
+    # solo puede CONSULTAR su propia información.
+    # =====================================================================
+    st.info(
+        "📷 Para registrar tu asistencia, escanea el código QR que tu docente muestra en clase. "
+        "Esta pantalla es solo para consultar tu historial.")
 
-    st.write(f"🕒 Hora actual del sistema: **{now.strftime('%H:%M:%S')}** ({current_day_esp})")
+    tab_mi_asistencia, tab_mis_permisos = st.tabs(["📊 Mi Asistencia", "📝 Mis Permisos"])
 
-    active_sch_found = None
-    import sqlite3
-
-    try:
-        conn_h = sqlite3.connect("modulo_horarios/database.db")
-        cursor_h = conn_h.cursor()
-
-        cursor_h.execute("SELECT id FROM seccion WHERE nombre = ?", (student_data.section,))
-        sec_res = cursor_h.fetchone()
-
-        if sec_res:
-            sec_id_val = sec_res[0]
-            cursor_h.execute("""
-                             SELECT hora_texto, materia_id, id
-                             FROM horario
-                             WHERE seccion_id = ?
-                               AND (dia = ? OR dia = ?)
-                             """, (sec_id_val, current_day_esp, current_day_eng))
-
-            bloques = cursor_h.fetchall()
-
-            for b in bloques:
-                hora_texto_val, sub_id_h, bloque_id_val = b[0], b[1], b[2]
-
-                h_ini_str, h_fin_str = "07:00", "12:00"
-                if "-" in str(hora_texto_val):
-                    partes = hora_texto_val.split("-")
-                    h_ini_str = partes[0].strip()
-                    h_fin_str = partes[1].strip()
-
-
-                def parse_custom_time(t_str):
-                    t_str = t_str.strip().lower()
-                    for fmt in ("%I:%M %p", "%H:%M", "%H:%M:%S", "%I:%M%p"):
-                        try:
-                            return datetime.strptime(t_str, fmt).time()
-                        except ValueError:
-                            continue
-                    return None
-
-
-                t_inicio = parse_custom_time(h_ini_str)
-                t_fin = parse_custom_time(h_fin_str)
-
-                if t_inicio and t_fin:
-                    # Convertir t_inicio a datetime de hoy para sumarle exactamente 10 minutos de tolerancia
-                    dt_hoy = datetime.today().date()
-                    dt_inicio_obj = datetime.combine(dt_hoy, t_inicio)
-                    dt_limite_obj = dt_inicio_obj + timedelta(minutes=10)
-                    t_limite = dt_limite_obj.time()
-
-                    # La clase está activa SOLO si estamos entre el inicio y los 10 minutos posteriores
-                    if t_inicio <= current_time <= t_limite:
-                        active_sch_found = (h_ini_str, h_fin_str, sub_id_h)
-                        break
-
-        conn_h.close()
-
-    except Exception as ex:
-        active_sch_local = session.query(Schedule).filter(
-            Schedule.section == student_data.section,
-            Schedule.day_of_week == current_day_eng,
-            Schedule.start_time <= current_time,
-            Schedule.end_time >= current_time
-        ).first()
-        if active_sch_local:
-            active_sch_found = (str(active_sch_local.start_time), str(active_sch_local.end_time),
-                                active_sch_local.subject_id)
-
-    if not active_sch_found:
-        st.warning(
-            "⚠️ **No tienes clases activas en este momento.** (Estás en horario libre, receso o fuera de clase).")
-    else:
-        h_ini, h_fin, sub_id_val = active_sch_found
-
-        sub_name = "Asignatura"
+    with tab_mi_asistencia:
         try:
-            conn_h = sqlite3.connect("modulo_horarios/database.db")
-            cursor_h = conn_h.cursor()
-            cursor_h.execute("SELECT nombre FROM materia WHERE id = ?", (sub_id_val,))
-            res_sub = cursor_h.fetchone()
-            if res_sub:
-                sub_name = res_sub[0]
-            conn_h.close()
-        except:
-            sub_obj = session.query(Subject).filter_by(id=sub_id_val).first()
-            if sub_obj:
-                sub_name = sub_obj.name
+            resultado_riesgo_propio = evaluate_student_risk_detailed(session, student_data.id)
+            render_badge_riesgo(resultado_riesgo_propio['status'], resultado_riesgo_propio['pct'])
 
-        st.success(f"📖 **Clase Activa en este Bloque:** {sub_name} ({h_ini} - {h_fin})")
+            historial_propio = session.query(Attendance).filter_by(
+                student_id=student_data.id
+            ).order_by(Attendance.date.desc()).all()
 
-        # -----------------------------------------------------------------
-        # VALIDACIÓN Y REGISTRO AUTOMÁTICO DE GPS (SIN BOTÓN)
-        # -----------------------------------------------------------------
-        loc = get_geolocation()
-        if loc and 'coords' in loc:
-            user_lat, user_lon = loc['coords']['latitude'], loc['coords']['longitude']
-            distance = calculate_distance(user_lat, user_lon, INSTITUTE_LAT, INSTITUTE_LON)
-
-            if distance <= MAX_DISTANCE_METERS:
-                sub_real_id = sub_id_val if isinstance(sub_id_val, int) else 1
-
-                existing_att = session.query(Attendance).filter_by(
-                    student_id=student_data.id,
-                    subject_id=sub_real_id,
-                    date=date.today()
-                ).first()
-
-                if existing_att and existing_att.status == "Presente":
-                    st.success(
-                        f"✅ Ya se registró tu asistencia previamente para la clase de **{sub_name}** en este bloque.")
-                else:
-                    if not existing_att:
-                        session.add(Attendance(
-                            student_id=student_data.id,
-                            subject_id=sub_real_id,
-                            date=date.today(),
-                            status="Presente",
-                            observation=f"GPS Bloque {h_ini}-{h_fin}"
-                        ))
-                    else:
-                        existing_att.status = "Presente"
-                        existing_att.observation = f"GPS Bloque {h_ini}-{h_fin}"
-
-                        # --- VALIDACIÓN ANTI-FRAUDE POR DISPOSITIVO ---
-                        # Creamos una clave única basada en el dispositivo/navegador para este bloque, fecha y materia
-                        clave_dispositivo_key = f"dispositivo_marco_{sub_real_id}_{date.today()}"
-
-                        # Verificamos si en esta sesión/navegador ya se registró asistencia para este bloque
-                        if st.session_state.get(clave_dispositivo_key, False):
-                            st.error(
-                                "❌ Este dispositivo ya registró una asistencia en este bloque. No se permite registrar a múltiples alumnos desde el mismo equipo.")
-                        else:
-                            session.commit()
-                            # Marcamos la sesión actual del navegador como "ocupada" para este bloque
-                            st.session_state[clave_dispositivo_key] = True
-
-                            st.balloons()
-                            st.success(
-                                f"🚀 ¡Ubicación validada! Asistencia registrada automáticamente para: **{sub_name}**")
-                            st.rerun()
-
+            if not historial_propio:
+                st.info("Todavía no tienes registros de asistencia.")
             else:
-                st.error(
-                    f"❌ Debes estar dentro del instituto para registrar tu asistencia. (Te encuentras a {distance:.2f} metros)")
-        else:
-            st.warning("Por favor activa y concede el acceso a tu ubicación GPS en el navegador.")
+                presentes_propio = sum(1 for h in historial_propio if h.status == "Presente")
+                tardanzas_propio = sum(1 for h in historial_propio if h.status == "Tardanza")
+                ausentes_propio = sum(1 for h in historial_propio if h.status == "Ausente")
+                permisos_propio = sum(1 for h in historial_propio if h.status == "Permiso")
+
+                col_mp1, col_mp2, col_mp3, col_mp4 = st.columns(4)
+                col_mp1.metric("Presentes", presentes_propio)
+                col_mp2.metric("Tardanzas", tardanzas_propio)
+                col_mp3.metric("Ausencias", ausentes_propio)
+                col_mp4.metric("Permisos", permisos_propio)
+
+                st.markdown("##### Historial completo")
+                datos_hist_propio = []
+                for h in historial_propio:
+                    mat_nombre = "-"
+                    if h.subject_id:
+                        mat_obj = session.query(Subject).filter_by(id=h.subject_id).first()
+                        if mat_obj:
+                            mat_nombre = mat_obj.name
+                    datos_hist_propio.append({
+                        "Fecha": h.date.strftime('%d/%m/%Y'),
+                        "Materia": mat_nombre,
+                        "Estado": h.status,
+                        "Observación": h.observation or "-"
+                    })
+                st.dataframe(pd.DataFrame(datos_hist_propio), width='stretch', hide_index=True)
+
+        except Exception:
+            st.error('❌ No se pudo cargar tu historial de asistencia por un problema de conexión. Recarga la página.')
+    with tab_mis_permisos:
+        try:
+            permisos_propios = session.query(Attendance).filter(
+                Attendance.student_id == student_data.id,
+                Attendance.observation.isnot(None),
+                Attendance.observation != ""
+            ).order_by(Attendance.date.desc()).all()
+
+            if not permisos_propios:
+                st.info("No tienes permisos ni justificaciones registradas.")
+            else:
+                datos_permisos_propio = []
+                for p in permisos_propios:
+                    datos_permisos_propio.append({
+                        "Fecha": p.date.strftime('%d/%m/%Y'),
+                        "Estado": p.status,
+                        "Detalle": p.observation,
+                        "Evidencia": "📎 Sí" if p.evidencia_path else "—"
+                    })
+                st.dataframe(pd.DataFrame(datos_permisos_propio), width='stretch', hide_index=True)
+
+                registros_con_evidencia_propio = [p for p in permisos_propios if p.evidencia_path]
+                if registros_con_evidencia_propio:
+                    st.markdown("###### 📎 Evidencias adjuntas")
+                    for p in registros_con_evidencia_propio:
+                        if os.path.exists(p.evidencia_path):
+                            with open(p.evidencia_path, "rb") as f_ev:
+                                st.download_button(
+                                    label=f"Descargar evidencia del {p.date.strftime('%d/%m/%Y')}",
+                                    data=f_ev.read(),
+                                    file_name=os.path.basename(p.evidencia_path),
+                                    key=f"btn_desc_evid_propio_{p.id}"
+                                )
+        except Exception:
+            st.error('❌ No se pudo cargar tu historial de permisos por un problema de conexión. Recarga la página.')
+    st.stop()
     st.stop()
 
 # -----------------------------------------------------------------------------
 # 2. PERFIL ADMINISTRADOR: PANTALLA PRINCIPAL CON SELECCIÓN DE MÓDULOS
 # -----------------------------------------------------------------------------
 if current_user.role == "Admin":
+
+    if st.session_state['admin_view'] == 'select_ciclo':
+        st.subheader("🎓 NEXUS — Selecciona tu Sesión de Trabajo")
+        st.write("Elige el ciclo escolar (año) donde quieres trabajar, o crea uno nuevo.")
+        st.write("")
+
+        todos_ciclos_landing = session.query(CicloEscolar).order_by(CicloEscolar.nombre.desc()).all()
+        items_landing = [("nuevo", None)] + [("ciclo", c) for c in todos_ciclos_landing]
+
+        cols_por_fila = 4
+        filas_landing = [items_landing[i:i + cols_por_fila] for i in range(0, len(items_landing), cols_por_fila)]
+
+        for fila in filas_landing:
+            cols_landing = st.columns(cols_por_fila)
+            for col, (tipo, ciclo_obj) in zip(cols_landing, fila):
+                with col:
+                    if tipo == "nuevo":
+                        st.markdown("""
+                        <div class="nexus-tech-card-wrap">
+                            <div class="nexus-tech-card" style="text-align:center; padding-top:2.2rem; padding-bottom:2.2rem;">
+                                <span class="nexus-tech-card-icon">➕</span>
+                                <div class="nexus-tech-card-title">Crear Nueva Sesión</div>
+                                <div class="nexus-tech-card-desc">Empieza un ciclo escolar nuevo, en blanco.</div>
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        if st.button("➕ Crear Nueva Sesión", key="btn_trigger_crear_ciclo_landing",
+                                     width='stretch'):
+                            st.session_state['mostrar_form_nuevo_ciclo'] = True
+                            st.rerun()
+                    else:
+                        c = ciclo_obj
+                        badge_activo = (
+                            '<div style="margin-top:0.5rem; display:inline-block; background:var(--nexus-navy); '
+                            'color:#fff; padding:0.15rem 0.7rem; border-radius:999px; font-size:0.72rem; '
+                            'font-weight:700;">ACTIVO AHORA</div>'
+                        ) if c.activo else ''
+                        st.markdown(f"""
+                        <div class="nexus-tech-card-wrap">
+                            <div class="nexus-tech-card" style="text-align:center; padding-top:2.2rem; padding-bottom:2rem;">
+                                <span class="nexus-tech-card-icon">📁</span>
+                                <div class="nexus-tech-card-title">{c.nombre}</div>
+                                <div class="nexus-tech-card-desc">Ciclo escolar {c.nombre}</div>
+                                {badge_activo}
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        etiqueta_btn = "✅ Ya estás aquí" if c.activo else "🔓 Entrar a este ciclo"
+                        if st.button(etiqueta_btn, key=f"btn_trigger_entrar_ciclo_{c.id}", width='stretch'):
+                            for cc in todos_ciclos_landing:
+                                cc.activo = (cc.id == c.id)
+                            session.commit()
+                            st.session_state.pop('ciclo_activo_id', None)
+                            st.session_state.pop('ciclo_activo_nombre', None)
+                            st.session_state['admin_view'] = 'dashboard'
+                            st.rerun()
+
+        # --- Formulario de creación (aparece tras darle clic a "Crear Nueva Sesión") ---
+        if st.session_state.get('mostrar_form_nuevo_ciclo'):
+            st.divider()
+            with st.form("form_crear_ciclo_landing"):
+                st.markdown("##### ➕ Nueva Sesión / Ciclo Escolar")
+                nombre_ciclo_landing = st.text_input("Nombre del ciclo (ej. 2027)",
+                                                     key="txt_nombre_ciclo_landing")
+                crear_y_entrar = st.form_submit_button("Crear y Entrar", type="primary")
+                if crear_y_entrar:
+                    nombre_limpio_landing = nombre_ciclo_landing.strip()
+                    if not nombre_limpio_landing:
+                        st.warning("Escribe un nombre para el ciclo.")
+                    elif session.query(CicloEscolar).filter_by(nombre=nombre_limpio_landing).first():
+                        st.error(f"Ya existe un ciclo llamado '{nombre_limpio_landing}'.")
+                    else:
+                        for cc in todos_ciclos_landing:
+                            cc.activo = False
+                        session.add(CicloEscolar(nombre=nombre_limpio_landing, activo=True))
+                        session.commit()
+                        st.session_state.pop('ciclo_activo_id', None)
+                        st.session_state.pop('ciclo_activo_nombre', None)
+                        st.session_state['mostrar_form_nuevo_ciclo'] = False
+                        st.session_state['admin_view'] = 'dashboard'
+                        st.success(f"✅ Ciclo '{nombre_limpio_landing}' creado y activado.")
+                        st.rerun()
+
+        st.stop()
+
     if st.session_state['admin_view'] == 'dashboard':
-        st.subheader("🏛️ Panel Central de Administración NEXUS")
+        ciclo_activo_dash = get_ciclo_activo(session)
+        col_dash_head1, col_dash_head2 = st.columns([4, 1])
+        with col_dash_head1:
+            st.subheader("🏛️ Panel Central de Administración NEXUS")
+            st.caption(f"📁 Trabajando en el ciclo: **{ciclo_activo_dash.nombre}**")
+        with col_dash_head2:
+            st.write("")
+            if st.button("🔄 Cambiar de Ciclo", key="btn_cambiar_ciclo_dash"):
+                st.session_state['admin_view'] = 'select_ciclo'
+                st.rerun()
         st.write("Selecciona el módulo al que deseas ingresar:")
         st.write("")
 
         col_m1, col_m2 = st.columns(2)
 
         with col_m1:
-            with st.container(border=True):
-                st.markdown("### 📅 MÓDULO DE HORARIOS")
-                st.caption(
-                    "Gestión y programación de horarios institucionales, asignación de materias y carga académica.")
-                st.write("")
-                if st.button("👉 Ingresar a Módulo de Horarios", type="primary", width='stretch',
-                             key="btn_goto_horarios_dash"):
-                    st.session_state['admin_view'] = 'horarios'
-                    st.rerun()
+            st.markdown("""
+            <div class="nexus-tech-card-wrap">
+                <div class="nexus-tech-card">
+                    <span class="nexus-tech-card-icon">📅</span>
+                    <div class="nexus-tech-card-title">Módulo de Horarios</div>
+                    <div class="nexus-tech-card-desc">
+                        Gestión y programación de horarios institucionales, asignación de
+                        materias y carga académica.
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            if st.button("👉 Ingresar a Módulo de Horarios", type="primary", width='stretch',
+                         key="btn_goto_horarios_dash"):
+                st.session_state['admin_view'] = 'horarios'
+                st.rerun()
 
         with col_m2:
-            with st.container(border=True):
-                st.markdown("### 📊 MÓDULO DE ASISTENCIA")
-                st.caption(
-                    "Control inteligente de asistencia, geolocalización, seguimiento de casos y semáforo de permanencia.")
-                st.write("")
-                if st.button("👉 Ingresar a Módulo de Asistencia", type="primary", width='stretch',
-                             key="btn_goto_asistencia_dash"):
-                    st.session_state['admin_view'] = 'asistencia'
-                    st.rerun()
+            st.markdown("""
+            <div class="nexus-tech-card-wrap">
+                <div class="nexus-tech-card">
+                    <span class="nexus-tech-card-icon">📊</span>
+                    <div class="nexus-tech-card-title">Módulo de Asistencia</div>
+                    <div class="nexus-tech-card-desc">
+                        Control inteligente de asistencia, geolocalización, seguimiento de
+                        casos y semáforo de permanencia.
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            if st.button("👉 Ingresar a Módulo de Asistencia", type="primary", width='stretch',
+                         key="btn_goto_asistencia_dash"):
+                st.session_state['admin_view'] = 'asistencia'
+                st.rerun()
 
         st.stop()
 
@@ -1663,10 +1934,15 @@ available_tabs = []
 if current_user.role == "Admin":
     available_tabs.append("🎓 Carga y Gestión de Estudiantes")
     available_tabs.append("👨‍🏫 Carga y Gestión de Docentes")
+    available_tabs.append("🚦 Semáforo Institucional")
 
+# Ahora el semáforo también aparece para Docente (si tiene sección)
 if current_user.role in ["Docente", "Admin"] and current_user.assigned_section:
     available_tabs.append("📋 Mi Sección (Orientador)")
     available_tabs.append("📝 Gestión de Permisos")
+    # Agregamos el semáforo para Docente también
+    if current_user.role == "Docente":
+        available_tabs.append("🚦 Semáforo Institucional")
 
 tabs = st.tabs(available_tabs)
 
@@ -1703,6 +1979,15 @@ if "🎓 Carga y Gestión de Estudiantes" in available_tabs:
         if not lista_docentes_horarios:
             lista_docentes_horarios = ["Sin Docentes Creados en Horarios"]
 
+        # --- Docentes REALES (cuentas ya creadas con su NIP en 'Carga y Gestión de
+        # Docentes'). Es lo que debe usarse para asignar el orientador — nunca el
+        # nombre suelto del módulo de horarios, que no es un usuario válido. ---
+        docentes_reales = session.query(User).filter_by(role="Docente").order_by(User.username).all()
+        mapa_docentes_reales = {u.username: u.username for u in docentes_reales}
+        opciones_docente_real = list(mapa_docentes_reales.keys()) if mapa_docentes_reales else [
+            "Sin Docentes Registrados (créalos primero en 'Carga y Gestión de Docentes')"
+        ]
+
         col_ex1, col_ex2 = st.columns([1, 1])
 
         with col_ex1:
@@ -1711,8 +1996,9 @@ if "🎓 Carga y Gestión de Estudiantes" in available_tabs:
 
                 seccion_destino = st.selectbox("1. Asignar a la Sección:", lista_secciones,
                                                key="sb_excel_section_dest_upload")
-                docente_orientador = st.selectbox("2. Asignar Docente Orientador:", lista_docentes_horarios,
-                                                  key="sb_excel_docente_orientador_select")
+                docente_orientador_label = st.selectbox("2. Asignar Docente Orientador:", opciones_docente_real,
+                                                        key="sb_excel_docente_orientador_select")
+                docente_orientador_nip = mapa_docentes_reales.get(docente_orientador_label)
                 uploaded_file = st.file_uploader("3. Seleccionar archivo Excel (.xlsx)", type=["xlsx", "xls"],
                                                  key="excel_file_uploader_input")
 
@@ -1743,7 +2029,7 @@ if "🎓 Carga y Gestión de Estudiantes" in available_tabs:
                                             if not user_existente:
                                                 nuevo_user_alumno = User(
                                                     username=nie_val,
-                                                    password="indet2026",
+                                                    password=hash_password("indet2026"),
                                                     role="Alumno",
                                                     assigned_section=seccion_destino,
                                                     student_id=nie_val
@@ -1757,22 +2043,16 @@ if "🎓 Carga y Gestión de Estudiantes" in available_tabs:
                                             if user_existente:
                                                 user_existente.assigned_section = seccion_destino
                                             actualizados += 1
-                                if docente_orientador != "Sin Docentes Creados en Horarios":
-                                    doc_user = session.query(User).filter_by(username=docente_orientador).first()
-                                    if not doc_user:
-                                        nuevo_doc = User(
-                                            username=docente_orientador,
-                                            password="indet2026",
-                                            role="Docente",
-                                            assigned_section=seccion_destino
-                                        )
-                                        session.add(nuevo_doc)
-                                    else:
+                                if docente_orientador_nip:
+                                    doc_user = session.query(User).filter_by(
+                                        username=docente_orientador_nip, role="Docente").first()
+                                    if doc_user:
                                         doc_user.assigned_section = seccion_destino
 
                                 session.commit()
                                 st.success(
-                                    f"✅ Proceso completado: {nuevos} registrados, {actualizados} actualizados en {seccion_destino} (Orientador: {docente_orientador}).")
+                                    f"✅ Proceso completado: {nuevos} registrados, {actualizados} actualizados en "
+                                    f"{seccion_destino} (Orientador: {docente_orientador_nip or 'ninguno asignado'}).")
                                 st.rerun()
                             else:
                                 st.error("El archivo debe incluir las columnas 'NIE' y 'Nombre'.")
@@ -1788,8 +2068,9 @@ if "🎓 Carga y Gestión de Estudiantes" in available_tabs:
                     manual_nie = st.text_input("NIE del Estudiante")
                     manual_nombre = st.text_input("Nombre Completo")
                     manual_seccion = st.selectbox("Sección Asignada", lista_secciones, key="sb_manual_reg_section")
-                    manual_orientador = st.selectbox("Docente Orientador Asignado", lista_docentes_horarios,
-                                                     key="sb_manual_reg_orientador")
+                    manual_orientador_label = st.selectbox("Docente Orientador Asignado", opciones_docente_real,
+                                                           key="sb_manual_reg_orientador")
+                    manual_orientador_nip = mapa_docentes_reales.get(manual_orientador_label)
 
                     submit_manual = st.form_submit_button("➕ Registrar Estudiante Individual", width='stretch')
 
@@ -1810,24 +2091,17 @@ if "🎓 Carga y Gestión de Estudiantes" in available_tabs:
                                     if not user_existente:
                                         nuevo_user_alumno = User(
                                             username=manual_nie.strip(),
-                                            password="indet2026",
+                                            password=hash_password("indet2026"),
                                             role="Alumno",
                                             assigned_section=manual_seccion,
                                             student_id=manual_nie.strip()
                                         )
                                         session.add(nuevo_user_alumno)
 
-                                    if manual_orientador != "Sin Docentes Creados en Horarios":
-                                        doc_user = session.query(User).filter_by(username=manual_orientador).first()
-                                        if not doc_user:
-                                            nuevo_doc = User(
-                                                username=manual_orientador,
-                                                password="indet2026",
-                                                role="Docente",
-                                                assigned_section=manual_seccion
-                                            )
-                                            session.add(nuevo_doc)
-                                        else:
+                                    if manual_orientador_nip:
+                                        doc_user = session.query(User).filter_by(
+                                            username=manual_orientador_nip, role="Docente").first()
+                                        if doc_user:
                                             doc_user.assigned_section = manual_seccion
 
                                     session.commit()
@@ -1882,18 +2156,45 @@ if "🎓 Carga y Gestión de Estudiantes" in available_tabs:
                 if st.button("🗑️ Borrar Todos los Estudiantes", type="secondary", key="btn_clear_all_students_confirm",
                              width='stretch'):
                     try:
-                        conn_db = sqlite3.connect("student_monitor.db")
-                        cursor_db = conn_db.cursor()
+                        todos_los_ids_est = [e.id for e in session.query(Student.id).all()]
 
-                        cursor_db.execute("DELETE FROM students;")
-                        conn_db.commit()
-                        conn_db.close()
+                        if not todos_los_ids_est:
+                            st.info("No hay estudiantes registrados para borrar.")
+                        else:
+                            # Se borra primero todo lo que depende del estudiante (respetando el
+                            # orden de llaves foráneas), y al final el estudiante mismo.
+                            session.query(QRAttendanceCheckin).filter(
+                                QRAttendanceCheckin.student_id.in_(todos_los_ids_est)).delete(
+                                synchronize_session=False)
+                            session.query(Matricula).filter(
+                                Matricula.student_id.in_(todos_los_ids_est)).delete(
+                                synchronize_session=False)
+                            session.query(ActaAsistencia).filter(
+                                ActaAsistencia.student_id.in_(todos_los_ids_est)).delete(
+                                synchronize_session=False)
+                            session.query(CaseTracker).filter(
+                                CaseTracker.student_id.in_(todos_los_ids_est)).delete(
+                                synchronize_session=False)
+                            session.query(Attendance).filter(
+                                Attendance.student_id.in_(todos_los_ids_est)).delete(
+                                synchronize_session=False)
+                            session.query(Justification).filter(
+                                Justification.student_id.in_(todos_los_ids_est)).delete(
+                                synchronize_session=False)
+                            # Cuentas de acceso (rol Alumno) ligadas a estos estudiantes
+                            session.query(User).filter(
+                                User.student_id.in_(todos_los_ids_est), User.role == "Alumno").delete(
+                                synchronize_session=False)
+                            session.query(Student).filter(
+                                Student.id.in_(todos_los_ids_est)).delete(synchronize_session=False)
 
-                        session.commit()
-
-                        st.success("¡Todos los estudiantes han sido borrados con éxito!")
-                        st.rerun()
+                            session.commit()
+                            st.success(
+                                f"✅ Se borraron {len(todos_los_ids_est)} estudiante(s) y todo su historial "
+                                f"relacionado (asistencias, permisos, casos, actas y cuentas de acceso).")
+                            st.rerun()
                     except Exception as err:
+                        session.rollback()
                         st.error(f"Error al borrar los estudiantes: {err}")
 
                 st.divider()
@@ -1917,7 +2218,7 @@ if "🎓 Carga y Gestión de Estudiantes" in available_tabs:
                             if nueva_pass_ind.strip():
                                 usr_al = session.query(User).filter_by(username=str(nie_elegido)).first()
                                 if usr_al:
-                                    usr_al.password = nueva_pass_ind.strip()
+                                    usr_al.password = hash_password(nueva_pass_ind.strip())
                                     session.commit()
                                     st.success(f"¡Contraseña actualizada para el alumno con NIE {nie_elegido}!")
                                     st.rerun()
@@ -1943,7 +2244,7 @@ if "🎓 Carga y Gestión de Estudiantes" in available_tabs:
                                 alumnos_users = session.query(User).filter_by(role="Alumno").all()
                                 contador_resets = 0
                                 for u in alumnos_users:
-                                    u.password = nueva_pass_masiva.strip()
+                                    u.password = hash_password(nueva_pass_masiva.strip())
                                     contador_resets += 1
                                 session.commit()
                                 st.success(
@@ -1984,22 +2285,60 @@ if "📋 Mi Sección (Orientador)" in available_tabs:
             "escaneándolo con la cámara de su celular. Se sigue exigiendo que estén dentro del instituto "
             "(GPS) y que escaneen desde su propio dispositivo vinculado.")
 
+        materia_detectada_nombre = detectar_materia_actual_horarios(current_user.assigned_section)
+        todas_las_materias = session.query(Subject).order_by(Subject.name).all()
+        mapa_materias = {m.name: m.id for m in todas_las_materias}
+
+        if materia_detectada_nombre:
+            st.success(f"🕒 Según el horario, ahora mismo toca: **{materia_detectada_nombre}**")
+        else:
+            st.warning(
+                "🕒 No se detectó una clase activa en tu horario para este momento "
+                "(puede ser receso, almuerzo, o que el horario de tu sección no esté cargado). "
+                "Elige la materia manualmente abajo.")
+
+        opciones_materia_qr = list(mapa_materias.keys())
+        if materia_detectada_nombre and materia_detectada_nombre not in opciones_materia_qr:
+            opciones_materia_qr.insert(0, materia_detectada_nombre)
+        if not opciones_materia_qr:
+            opciones_materia_qr = ["(Sin materias registradas)"]
+
+        idx_materia_default = (
+            opciones_materia_qr.index(materia_detectada_nombre)
+            if materia_detectada_nombre in opciones_materia_qr else 0
+        )
+        materia_elegida_qr = st.selectbox(
+            "Materia para este QR (detectada automáticamente, puedes cambiarla)",
+            opciones_materia_qr, index=idx_materia_default, key="sb_materia_qr_manual"
+        )
+
         if st.button("📷 Generar Nuevo QR de Asistencia", key="btn_generar_qr_asistencia"):
-            nuevo_token_qr = secrets.token_urlsafe(16)
-            ahora_qr = datetime.now()
-            expiracion_qr = ahora_qr + timedelta(minutes=QR_TOKEN_VALIDEZ_MINUTOS)
-            nuevo_qr_row = QRAttendanceToken(
-                token=nuevo_token_qr,
-                seccion=current_user.assigned_section,
-                docente_username=getattr(current_user, 'username', None),
-                created_at=ahora_qr,
-                expires_at=expiracion_qr
-            )
-            session.add(nuevo_qr_row)
-            session.commit()
-            st.session_state['qr_token_activo'] = nuevo_token_qr
-            st.session_state['qr_token_expira'] = expiracion_qr.isoformat()
-            st.rerun()
+            try:
+                subject_para_qr = obtener_o_crear_subject_por_nombre(session, materia_elegida_qr)
+
+                nuevo_token_qr = secrets.token_urlsafe(16)
+                ahora_qr = datetime.now()
+                expiracion_qr = ahora_qr + timedelta(minutes=QR_TOKEN_VALIDEZ_MINUTOS)
+                nuevo_qr_row = QRAttendanceToken(
+                    token=nuevo_token_qr,
+                    seccion=current_user.assigned_section,
+                    subject_id=subject_para_qr.id,
+                    docente_username=getattr(current_user, 'username', None),
+                    created_at=ahora_qr,
+                    expires_at=expiracion_qr,
+                    ciclo_id=get_ciclo_activo(session).id
+                )
+                session.add(nuevo_qr_row)
+                session.commit()
+                st.session_state['qr_token_activo'] = nuevo_token_qr
+                st.session_state['qr_token_expira'] = expiracion_qr.isoformat()
+                st.session_state['qr_token_materia'] = materia_elegida_qr
+                st.rerun()
+            except Exception:
+                session.rollback()
+                st.error(
+                    "❌ No se pudo generar el QR por un problema de conexión con la base de datos. "
+                    "Intenta de nuevo en unos segundos.")
 
         if st.session_state.get('qr_token_activo'):
             expira_dt_qr = datetime.fromisoformat(st.session_state['qr_token_expira'])
@@ -2019,6 +2358,7 @@ if "📋 Mi Sección (Orientador)" in available_tabs:
                         st.image(buf_qr.getvalue(),
                                  caption=f"Válido por ~{int(segundos_restantes_qr)} segundos más", width=220)
                     with col_qr2:
+                        st.caption(f"📚 Materia: **{st.session_state.get('qr_token_materia', '-')}**")
                         st.caption("Si el QR no se puede escanear, comparte este enlace directamente:")
                         st.code(url_checkin_qr, language=None)
 
@@ -2106,7 +2446,8 @@ if "📋 Mi Sección (Orientador)" in available_tabs:
                                 nuevo_reg = Attendance(
                                     student_id=est.id,
                                     date=fecha_consulta,
-                                    status=nuevo_estado
+                                    status=nuevo_estado,
+                                    ciclo_id=get_ciclo_activo(session).id
                                 )
                                 session.add(nuevo_reg)
                             session.commit()
@@ -2247,6 +2588,7 @@ if "📋 Mi Sección (Orientador)" in available_tabs:
                     skel_placeholder_acta.empty()
 
                     # --- Vincular con un caso de seguimiento (CaseTracker) ---
+                    ciclo_activo_acta = get_ciclo_activo(session)
                     caso_abierto = session.query(CaseTracker).filter(
                         CaseTracker.student_id == est_obj.id,
                         CaseTracker.status != 'Cerrado'
@@ -2257,7 +2599,8 @@ if "📋 Mi Sección (Orientador)" in available_tabs:
                             status='Observación',
                             notes=f"Caso abierto automáticamente al generar acta de asistencia el "
                                   f"{date.today().strftime('%d/%m/%Y')}.",
-                            created_at=date.today()
+                            created_at=date.today(),
+                            ciclo_id=ciclo_activo_acta.id
                         )
                         session.add(caso_abierto)
                         session.flush()  # para obtener caso_abierto.id antes del commit final
@@ -2271,7 +2614,8 @@ if "📋 Mi Sección (Orientador)" in available_tabs:
                         acuerdos="\n".join([a for a in acuerdos_finales if a and a.strip()]),
                         compromisos="\n".join([c for c in compromisos_finales if c and c.strip()]),
                         case_tracker_id=caso_abierto.id,
-                        creado_por=getattr(current_user, 'username', None)
+                        creado_por=getattr(current_user, 'username', None),
+                        ciclo_id=ciclo_activo_acta.id
                     )
                     session.add(nueva_acta)
                     session.commit()
@@ -2410,7 +2754,8 @@ if "📝 Gestión de Permisos" in available_tabs:
                                     date=dia_actual,
                                     status="Permiso",
                                     observation=texto_observacion,
-                                    evidencia_path=ruta_evidencia_guardada
+                                    evidencia_path=ruta_evidencia_guardada,
+                                    ciclo_id=get_ciclo_activo(session).id
                                 )
                                 session.add(nuevo_reg_att)
                             else:
@@ -2522,7 +2867,7 @@ if "👨‍🏫 Carga y Gestión de Docentes" in available_tabs:
                             if not doc_existente:
                                 nuevo_docente = User(
                                     username=nie_doc_str,
-                                    password=nuevo_pass_doc.strip() if nuevo_pass_doc.strip() else "indet2026",
+                                    password=hash_password(nuevo_pass_doc.strip() if nuevo_pass_doc.strip() else "indet2026"),
                                     role="Docente",
                                     assigned_section=sec_val
                                 )
@@ -2532,7 +2877,7 @@ if "👨‍🏫 Carga y Gestión de Docentes" in available_tabs:
                                     f"¡Docente '{docente_seleccionado_reg}' (Usuario: {nie_doc_str}) creado con éxito! Sección asignada: {seccion_encontrada}")
                                 st.rerun()
                             else:
-                                doc_existente.password = nuevo_pass_doc.strip() if nuevo_pass_doc.strip() else doc_existente.password
+                                doc_existente.password = hash_password(nuevo_pass_doc.strip()) if nuevo_pass_doc.strip() else doc_existente.password
                                 doc_existente.assigned_section = sec_val
                                 session.commit()
                                 st.success(
@@ -2605,7 +2950,7 @@ if "👨‍🏫 Carga y Gestión de Docentes" in available_tabs:
                         if nueva_pass_docente.strip():
                             doc_usr = session.query(User).filter_by(username=username_pass, role="Docente").first()
                             if doc_usr:
-                                doc_usr.password = nueva_pass_docente.strip()
+                                doc_usr.password = hash_password(nueva_pass_docente.strip())
                                 session.commit()
                                 st.success(f"¡Contraseña actualizada con éxito para el docente '{username_pass}'!")
                                 st.rerun()
@@ -2615,3 +2960,121 @@ if "👨‍🏫 Carga y Gestión de Docentes" in available_tabs:
                             st.warning("Por favor ingresa una contraseña válida.")
                 else:
                     st.info("No hay docentes registrados para modificar contraseña.")
+
+# -------------------------------------------------------------
+# TAB: SEMÁFORO INSTITUCIONAL (SOLO ADMIN)
+# -------------------------------------------------------------
+if "🚦 Semáforo Institucional" in available_tabs:
+    idx_sem = available_tabs.index("🚦 Semáforo Institucional")
+    with tabs[idx_sem]:
+        st.subheader("🚦 Semáforo Institucional de Riesgo")
+        st.caption(
+            "Vista de todos los estudiantes según su nivel de riesgo, calculado con los últimos 30 "
+            "días de asistencia (mismo motor que usa el orientador y las actas).")
+
+        try:
+            skel_sem = st.empty()
+            mostrar_skeleton(skel_sem, n_lineas=6, titulo="Calculando el semáforo institucional...")
+            resumen_semaforo = get_institutional_semaphore(session)
+            skel_sem.empty()
+
+            total_estudiantes_sem = sum(len(v) for v in resumen_semaforo.values())
+
+            if total_estudiantes_sem == 0:
+                st.info("No hay estudiantes registrados todavía.")
+            else:
+                col_sem1, col_sem2, col_sem3, col_sem4 = st.columns(4)
+                col_sem1.metric("Total Estudiantes", total_estudiantes_sem)
+                col_sem2.metric("🟢 Riesgo Bajo", len(resumen_semaforo['🟢']))
+                col_sem3.metric("🟡 Riesgo Medio", len(resumen_semaforo['🟡']))
+                col_sem4.metric("🔴 Riesgo Alto", len(resumen_semaforo['🔴']))
+
+                st.divider()
+
+                # --- dentro de la pestaña del semáforo ---
+
+                # Obtener todas las secciones disponibles (para Admin)
+                secciones_disp_sem = sorted({
+                    e['student'].section for lst in resumen_semaforo.values() for e in lst
+                })
+
+                col_f1, col_f2 = st.columns([1, 2])
+                with col_f1:
+                    if current_user.role == "Docente":
+                        filtro_seccion_sem = current_user.assigned_section
+                        st.caption(f"📋 Sección: **{filtro_seccion_sem}**")
+                    else:
+                        filtro_seccion_sem = st.selectbox(
+                            "Filtrar por sección", ["Todas"] + secciones_disp_sem,
+                            key="sb_filtro_seccion_semaforo"
+                        )
+                with col_f2:
+                    filtro_nivel_sem = st.multiselect(
+                        "Filtrar por nivel de riesgo", ["🔴 Alto", "🟡 Medio", "🟢 Bajo"],
+                        default=["🔴 Alto", "🟡 Medio"], key="ms_filtro_nivel_semaforo"
+                    )
+                col_f1, col_f2 = st.columns([1, 2])
+                with col_f1:
+                    filtro_seccion_sem = st.selectbox(
+                        "Filtrar por sección", ["Todas"] + secciones_disp_sem,
+                        key="sb_filtro_seccion_semaforo")
+                with col_f2:
+                    filtro_nivel_sem = st.multiselect(
+                        "Filtrar por nivel de riesgo", ["🔴 Alto", "🟡 Medio", "🟢 Bajo"],
+                        default=["🔴 Alto", "🟡 Medio"], key="ms_filtro_nivel_semaforo")
+
+                mapa_nivel_sem = {"🔴 Alto": "🔴", "🟡 Medio": "🟡", "🟢 Bajo": "🟢"}
+                niveles_a_mostrar = [mapa_nivel_sem[n] for n in filtro_nivel_sem]
+
+                hay_resultados_sem = False
+                for nivel in ["🔴", "🟡", "🟢"]:
+                    if nivel not in niveles_a_mostrar:
+                        continue
+                    entradas_nivel = resumen_semaforo[nivel]
+                    # Aplicar filtro de sección (si no es "Todas")
+                    if filtro_seccion_sem != "Todas":
+                        entradas_nivel = [e for e in entradas_nivel if e['student'].section == filtro_seccion_sem]
+                    if not entradas_nivel:
+                        continue
+                    # ... renderizar tarjetas ...
+
+                    hay_resultados_sem = True
+                    cfg_nivel = NEXUS_RIESGO_BADGE[nivel]
+                    st.markdown(f"#### {cfg_nivel['icon']} {cfg_nivel['label']} ({len(entradas_nivel)})")
+
+                    entradas_ordenadas = sorted(entradas_nivel, key=lambda e: e['pct'])
+                    cols_grid_sem = st.columns(3)
+                    for i, entrada in enumerate(entradas_ordenadas):
+                        est_sem = entrada['student']
+                        with cols_grid_sem[i % 3]:
+                            clase_pulso_sem = "nexus-badge-pulse" if nivel == "🔴" else ""
+                            patrones_html_sem = "".join(
+                                f"<li style='font-size:0.78rem; margin-bottom:2px;'>{p}</li>"
+                                for p in entrada['patterns'][:3]
+                            )
+                            lista_html_sem = (
+                                f"<ul style='margin:0.4rem 0 0 1.1rem; padding:0;'>{patrones_html_sem}</ul>"
+                                if patrones_html_sem else ""
+                            )
+                            st.markdown(f"""
+                            <div class="{clase_pulso_sem}" style="background:{cfg_nivel['bg']};
+                                        border:1.5px solid {cfg_nivel['border']}; border-radius:12px;
+                                        padding:0.9rem 1rem; margin-bottom:0.9rem;">
+                                <div style="font-weight:700; color:{cfg_nivel['fg']};">{est_sem.name}</div>
+                                <div style="font-size:0.8rem; opacity:0.8; color:{cfg_nivel['fg']};">
+                                    NIE: {est_sem.id} · Sección: {est_sem.section}
+                                </div>
+                                <div style="font-size:0.82rem; margin-top:0.35rem; color:{cfg_nivel['fg']};">
+                                    Asistencia: <b>{entrada['pct']}%</b>
+                                </div>
+                                {lista_html_sem}
+                            </div>
+                            """, unsafe_allow_html=True)
+
+                if not hay_resultados_sem:
+                    st.info("No hay estudiantes que coincidan con los filtros seleccionados.")
+
+        except Exception:
+            st.error(
+                "❌ No se pudo calcular el semáforo institucional por un problema de conexión. "
+                "Intenta de nuevo en unos segundos.")
