@@ -182,17 +182,11 @@ class Schedule(Base):
     subject = relationship('Subject')
 
 
-# --- CONEXIÓN A POSTGRESQL (Neon) ---
-# La URL de conexión NUNCA va escrita aquí en el código: se lee desde
-# .streamlit/secrets.toml en local, o desde el panel "Secrets" de Streamlit
-# Cloud en producción. Así, el mismo código se conecta a la rama 'dev' cuando
-# trabajas en PyCharm y a la rama 'production' cuando corre desplegado,
-# simplemente porque cada entorno tiene un secrets.toml distinto.
-DB_URL = st.secrets["connections"]["postgresql"]["url"]
-
-# pool_pre_ping=True: revisa que la conexión siga viva antes de usarla.
-# Es importante con Neon porque el "pooler" puede cerrar conexiones inactivas.
-engine = create_engine(DB_URL, pool_pre_ping=True, echo=False)
+# --- CONEXIÓN A BASE DE DATOS LOCAL (SQLite) ---
+# Se utiliza directamente la base de datos local 'student_monitor.db' en tu computadora,
+# asegurando que el sistema funcione 100% independiente de Neon, internet o cuentas externas.
+DB_URL = "sqlite:///student_monitor.db"
+engine = create_engine(DB_URL, connect_args={"check_same_thread": False}, echo=False)
 
 
 def calculate_distance(lat1, lon1, lat2, lon2):

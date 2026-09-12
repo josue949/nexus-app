@@ -1,1 +1,16 @@
-.streamlit/secrets.toml
+__pycache__/
+*.py[cod]
+*.venv/
+.venv/
+*.db
+/data/
+student_monitor.db
+modulo_horarios/database.db
+*.log
+*.pdf
+evidencias_permisos/*.pdf
+secret.toml
+.env
+Proyectos/
+respaldo_neon/
+.idea/

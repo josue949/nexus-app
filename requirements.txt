@@ -32,3 +32,4 @@ streamlit-js-eval
 psycopg2-binary
 fpdf2
 qrcode[pil]
+bcrypt

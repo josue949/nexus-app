@@ -31,6 +31,17 @@ APP_BASE_URL = "http://localhost:8501"
 
 QR_TOKEN_VALIDEZ_MINUTOS = 5
 
+# Bloques de clase (sin recesos), compartidos por la detección de materia actual
+# y la reconciliación de ausencias — mismos horarios que usa el módulo de Horarios.
+MEDIOS_BLOQUES_HORARIO = [
+    {"id": 1, "ini": "07:00", "fin": "07:45"}, {"id": 2, "ini": "07:45", "fin": "08:30"},
+    {"id": 3, "ini": "08:40", "fin": "09:25"}, {"id": 4, "ini": "09:25", "fin": "10:10"},
+    {"id": 5, "ini": "10:20", "fin": "11:05"}, {"id": 6, "ini": "11:05", "fin": "11:50"},
+    {"id": 7, "ini": "13:00", "fin": "13:45"}, {"id": 8, "ini": "13:45", "fin": "14:30"},
+    {"id": 9, "ini": "14:40", "fin": "15:25"}, {"id": 10, "ini": "15:25", "fin": "16:10"},
+    {"id": 11, "ini": "16:20", "fin": "17:10"}, {"id": 12, "ini": "17:10", "fin": "17:50"},
+]
+
 # Módulo de Horarios integrado localmente para la nube
 FASTAPI_HORARIOS_URL = "modo_integrado"
 
@@ -547,6 +558,15 @@ def _ejecutar_init_db_una_sola_vez():
 try:
     _ejecutar_init_db_una_sola_vez()
     session = get_session()
+    # Rehidratar usuario desde user_id si está guardado
+    if st.session_state.get('user') is None and st.session_state.get('user_id') is not None:
+        try:
+            user_obj = session.query(User).get(st.session_state['user_id'])
+            st.session_state['user'] = user_obj
+        except Exception as e:
+            st.warning('No se pudo cargar el usuario guardado')
+            st.session_state['user'] = None
+            st.session_state['user_id'] = None
 except Exception as e:
     st.error(
         "❌ No se pudo conectar con la base de datos. Esto puede ser temporal (el servidor de base de "
@@ -559,6 +579,8 @@ except Exception as e:
 # Manejo de Sesión / Estado
 if 'user' not in st.session_state:
     st.session_state['user'] = None
+if 'user_id' not in st.session_state:
+    st.session_state['user_id'] = None
 
 if 'admin_view' not in st.session_state:
     st.session_state['admin_view'] = 'select_ciclo'  # Opciones: 'select_ciclo', 'dashboard', 'horarios', 'asistencia'
@@ -595,6 +617,7 @@ if st.session_state['user'] is None:
                 user_found = session.query(User).filter_by(username=username_input).first()
                 if user_found and verify_password(password_input, user_found.password):
                     st.session_state['user'] = user_found
+                    st.session_state['user_id'] = user_found.id
                     st.session_state['admin_view'] = 'select_ciclo'
                     st.success(f"Bienvenido {user_found.username} ({user_found.role})")
                     st.rerun()
@@ -669,16 +692,8 @@ def detectar_materia_actual_horarios(seccion_nombre):
 
     # Mismos bloques horarios que usa el módulo de Horarios (ver pestaña
     # "Visualizar y Generar Horarios"), solo los bloques de clase (sin recesos).
-    medios_bloques_ref = [
-        {"id": 1, "ini": "07:00", "fin": "07:45"}, {"id": 2, "ini": "07:45", "fin": "08:30"},
-        {"id": 3, "ini": "08:40", "fin": "09:25"}, {"id": 4, "ini": "09:25", "fin": "10:10"},
-        {"id": 5, "ini": "10:20", "fin": "11:05"}, {"id": 6, "ini": "11:05", "fin": "11:50"},
-        {"id": 7, "ini": "13:00", "fin": "13:45"}, {"id": 8, "ini": "13:45", "fin": "14:30"},
-        {"id": 9, "ini": "14:40", "fin": "15:25"}, {"id": 10, "ini": "15:25", "fin": "16:10"},
-        {"id": 11, "ini": "16:20", "fin": "17:10"}, {"id": 12, "ini": "17:10", "fin": "17:50"},
-    ]
     bloque_actual_id = None
-    for b in medios_bloques_ref:
+    for b in MEDIOS_BLOQUES_HORARIO:
         h_ini = datetime.strptime(b["ini"], "%H:%M").time()
         h_fin = datetime.strptime(b["fin"], "%H:%M").time()
         if h_ini <= hora_actual <= h_fin:
@@ -722,6 +737,102 @@ def obtener_o_crear_subject_por_nombre(session, nombre_materia):
     session.add(nueva_materia)
     session.commit()
     return nueva_materia
+
+
+def obtener_bloques_pasados_hoy(seccion_nombre):
+    """Devuelve el nombre de cada materia cuyo bloque de clase, HOY, ya terminó
+    (según el horario real de la sección). Se usa para reconciliar asistencia:
+    solo se puede marcar 'Ausente' un bloque que ya pasó, nunca uno futuro.
+    Devuelve lista vacía en fin de semana (sábado/domingo)."""
+    import sqlite3
+
+    ahora = datetime.now()
+    if ahora.weekday() >= 5:  # 5=sábado, 6=domingo
+        return []
+
+    dias_ingles = {'Monday': 'Lunes', 'Tuesday': 'Martes', 'Wednesday': 'Miércoles',
+                   'Thursday': 'Jueves', 'Friday': 'Viernes'}
+    dia_actual_esp = dias_ingles.get(ahora.strftime('%A'))
+    if not dia_actual_esp:
+        return []
+    hora_actual = ahora.time()
+
+    bloques_pasados_ids = [
+        b["id"] for b in MEDIOS_BLOQUES_HORARIO
+        if datetime.strptime(b["fin"], "%H:%M").time() <= hora_actual
+    ]
+    if not bloques_pasados_ids:
+        return []
+
+    try:
+        conn_h = sqlite3.connect("modulo_horarios/database.db")
+        cursor_h = conn_h.cursor()
+        cursor_h.execute("SELECT id FROM seccion WHERE nombre = ?", (seccion_nombre,))
+        sec_res = cursor_h.fetchone()
+        if not sec_res:
+            conn_h.close()
+            return []
+
+        placeholders = ",".join("?" * len(bloques_pasados_ids))
+        cursor_h.execute(f"""
+            SELECT DISTINCT m.nombre
+            FROM horario h
+            JOIN materia m ON h.materia_id = m.id
+            WHERE h.seccion_id = ? AND h.dia = ? AND h.bloque_id IN ({placeholders})
+        """, (sec_res[0], dia_actual_esp, *bloques_pasados_ids))
+        resultados = [r[0] for r in cursor_h.fetchall()]
+        conn_h.close()
+        return resultados
+    except Exception:
+        return []
+
+
+def reconciliar_ausencias_seccion(session, seccion_nombre):
+    """Para cada bloque de clase de HOY que ya pasó, revisa el listado de
+    estudiantes de la sección y crea automáticamente un registro 'Ausente'
+    para quien no tenga ya un registro (por QR o manual) en ese bloque. El
+    docente puede corregir cualquiera de estos registros manualmente después
+    (a Presente o Permiso) — esta función nunca sobreescribe un registro que
+    ya exista, sea cual sea su estado."""
+    materias_pasadas = obtener_bloques_pasados_hoy(seccion_nombre)
+    if not materias_pasadas:
+        return 0
+
+    roster = session.query(Student).filter_by(section=seccion_nombre).all()
+    if not roster:
+        return 0
+
+    hoy = date.today()
+    ciclo_id_actual = get_ciclo_activo(session).id
+    creados = 0
+
+    for nombre_materia in materias_pasadas:
+        subject_obj = obtener_o_crear_subject_por_nombre(session, nombre_materia)
+
+        # Una sola consulta trae TODOS los registros ya existentes de este bloque,
+        # en vez de una consulta por estudiante (ver optimización del punto 2).
+        ids_ya_registrados = {
+            r[0] for r in session.query(Attendance.student_id).filter_by(
+                subject_id=subject_obj.id, date=hoy
+            ).filter(Attendance.student_id.in_([e.id for e in roster])).all()
+        }
+
+        for est in roster:
+            if est.id in ids_ya_registrados:
+                continue
+            session.add(Attendance(
+                student_id=est.id,
+                subject_id=subject_obj.id,
+                date=hoy,
+                status="Ausente",
+                observation="Registrado automáticamente: no se escaneó QR en este bloque.",
+                ciclo_id=ciclo_id_actual
+            ))
+            creados += 1
+
+    if creados:
+        session.commit()
+    return creados
 
 
 def get_ciclo_activo(session):
@@ -780,6 +891,7 @@ with col_h1:
 with col_h2:
     if st.button("🚪 Cerrar Sesión", key="btn_logout_header"):
         st.session_state['user'] = None
+        st.session_state['user_id'] = None
         st.session_state['admin_view'] = 'select_ciclo'
         st.rerun()
 
@@ -1936,13 +2048,9 @@ if current_user.role == "Admin":
     available_tabs.append("👨‍🏫 Carga y Gestión de Docentes")
     available_tabs.append("🚦 Semáforo Institucional")
 
-# Ahora el semáforo también aparece para Docente (si tiene sección)
 if current_user.role in ["Docente", "Admin"] and current_user.assigned_section:
     available_tabs.append("📋 Mi Sección (Orientador)")
     available_tabs.append("📝 Gestión de Permisos")
-    # Agregamos el semáforo para Docente también
-    if current_user.role == "Docente":
-        available_tabs.append("🚦 Semáforo Institucional")
 
 tabs = st.tabs(available_tabs)
 
@@ -2263,6 +2371,12 @@ if "📋 Mi Sección (Orientador)" in available_tabs:
     idx = available_tabs.index("📋 Mi Sección (Orientador)")
     with tabs[idx]:
         st.subheader(f"📋 Panel del Docente Orientador — Sección: {current_user.assigned_section}")
+
+        # --- RECONCILIAR AUSENCIAS DE BLOQUES YA PASADOS HOY (una vez por carga) ---
+        try:
+            reconciliar_ausencias_seccion(session, current_user.assigned_section)
+        except Exception:
+            session.rollback()
 
         # --- BANNER DE ALERTAS ACCIONABLES ---
         alertas_docente = get_alertas_docente(session, current_user.assigned_section)
@@ -2991,28 +3105,9 @@ if "🚦 Semáforo Institucional" in available_tabs:
 
                 st.divider()
 
-                # --- dentro de la pestaña del semáforo ---
-
-                # Obtener todas las secciones disponibles (para Admin)
                 secciones_disp_sem = sorted({
                     e['student'].section for lst in resumen_semaforo.values() for e in lst
                 })
-
-                col_f1, col_f2 = st.columns([1, 2])
-                with col_f1:
-                    if current_user.role == "Docente":
-                        filtro_seccion_sem = current_user.assigned_section
-                        st.caption(f"📋 Sección: **{filtro_seccion_sem}**")
-                    else:
-                        filtro_seccion_sem = st.selectbox(
-                            "Filtrar por sección", ["Todas"] + secciones_disp_sem,
-                            key="sb_filtro_seccion_semaforo"
-                        )
-                with col_f2:
-                    filtro_nivel_sem = st.multiselect(
-                        "Filtrar por nivel de riesgo", ["🔴 Alto", "🟡 Medio", "🟢 Bajo"],
-                        default=["🔴 Alto", "🟡 Medio"], key="ms_filtro_nivel_semaforo"
-                    )
                 col_f1, col_f2 = st.columns([1, 2])
                 with col_f1:
                     filtro_seccion_sem = st.selectbox(
@@ -3030,13 +3125,12 @@ if "🚦 Semáforo Institucional" in available_tabs:
                 for nivel in ["🔴", "🟡", "🟢"]:
                     if nivel not in niveles_a_mostrar:
                         continue
+
                     entradas_nivel = resumen_semaforo[nivel]
-                    # Aplicar filtro de sección (si no es "Todas")
                     if filtro_seccion_sem != "Todas":
                         entradas_nivel = [e for e in entradas_nivel if e['student'].section == filtro_seccion_sem]
                     if not entradas_nivel:
                         continue
-                    # ... renderizar tarjetas ...
 
                     hay_resultados_sem = True
                     cfg_nivel = NEXUS_RIESGO_BADGE[nivel]
