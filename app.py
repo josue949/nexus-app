@@ -1273,8 +1273,68 @@ if current_user.role == "Admin":
         import random
 
         try:
+            import os
+            os.makedirs("modulo_horarios", exist_ok=True)
             conn_h = sqlite3.connect("modulo_horarios/database.db")
             cursor_h = conn_h.cursor()
+
+            # Asegurar la creación de todas las tablas del módulo de horarios
+            cursor_h.execute("""
+                CREATE TABLE IF NOT EXISTS seccion (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    nombre TEXT NOT NULL,
+                    modalidad TEXT NOT NULL,
+                    anio TEXT NOT NULL
+                );
+            """)
+            cursor_h.execute("""
+                CREATE TABLE IF NOT EXISTS docente (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    nombre TEXT NOT NULL,
+                    correo_institucional TEXT NOT NULL,
+                    turno_preferente TEXT NOT NULL,
+                    dias_matutino TEXT,
+                    dias_vespertino TEXT
+                );
+            """)
+            cursor_h.execute("""
+                CREATE TABLE IF NOT EXISTS materia (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    nombre TEXT NOT NULL,
+                    tipo TEXT NOT NULL
+                );
+            """)
+            cursor_h.execute("""
+                CREATE TABLE IF NOT EXISTS cargaacademica (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    docente_id INTEGER NOT NULL,
+                    seccion_id INTEGER NOT NULL,
+                    materia_id INTEGER NOT NULL,
+                    horas_semanales INTEGER NOT NULL
+                );
+            """)
+            cursor_h.execute("""
+                CREATE TABLE IF NOT EXISTS horario (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    seccion_id INTEGER NOT NULL,
+                    docente_id INTEGER NOT NULL,
+                    materia_id INTEGER NOT NULL,
+                    dia TEXT NOT NULL,
+                    bloque_id INTEGER NOT NULL,
+                    hora_texto TEXT NOT NULL,
+                    origen TEXT DEFAULT 'generado'
+                );
+            """)
+            cursor_h.execute("""
+                CREATE TABLE IF NOT EXISTS estudiante (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    nie TEXT,
+                    nombre TEXT NOT NULL,
+                    grado TEXT NOT NULL,
+                    seccion TEXT NOT NULL
+                );
+            """)
+            conn_h.commit()
 
             # --- PARCHE QUIRÚRGICO: Asegurar columnas de días en la tabla docente ---
             try:
