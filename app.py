@@ -623,10 +623,10 @@ if st.session_state['user'] is None:
                     st.rerun()
                 else:
                     st.error("Usuario o contraseña incorrectos")
-            except Exception:
+            except Exception as ex:
+                session.rollback()
                 st.error(
-                    "❌ No se pudo conectar con el sistema en este momento. Espera unos segundos y vuelve "
-                    "a intentar — si el problema sigue, avisa al administrador.")
+                    f"❌ No se pudo conectar con el sistema en este momento: {ex}")
 
         st.caption("🔒 **Credenciales de Prueba:**")
         st.caption(

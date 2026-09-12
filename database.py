@@ -201,7 +201,12 @@ if DB_URL.startswith("postgres://"):
     DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
 
 connect_args = {"check_same_thread": False} if DB_URL.startswith("sqlite") else {}
-engine = create_engine(DB_URL, connect_args=connect_args, echo=False)
+engine_kwargs = {"connect_args": connect_args, "echo": False}
+if not DB_URL.startswith("sqlite"):
+    engine_kwargs["pool_pre_ping"] = True
+    engine_kwargs["pool_recycle"] = 300
+
+engine = create_engine(DB_URL, **engine_kwargs)
 
 
 def calculate_distance(lat1, lon1, lat2, lon2):
