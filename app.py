@@ -1268,92 +1268,102 @@ if current_user.role == "Admin":
         st.info(
             "Sistema integrado nativamente: gestión de secciones, docentes, cargas, generación algorítmica y control total.")
 
-        import sqlite3
-
         import random
+        from database import get_raw_connection
 
         try:
-            import os
-            os.makedirs("modulo_horarios", exist_ok=True)
-            conn_h = sqlite3.connect("modulo_horarios/database.db")
-            cursor_h = conn_h.cursor()
+            raw_conn = get_raw_connection()
+            is_sqlite = not hasattr(raw_conn, 'cursor_factory')
 
-            # Asegurar la creación de todas las tablas del módulo de horarios
-            cursor_h.execute("""
-                CREATE TABLE IF NOT EXISTS seccion (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    nombre TEXT NOT NULL,
-                    modalidad TEXT NOT NULL,
-                    anio TEXT NOT NULL
-                );
-            """)
-            cursor_h.execute("""
-                CREATE TABLE IF NOT EXISTS docente (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    nombre TEXT NOT NULL,
-                    correo_institucional TEXT NOT NULL,
-                    turno_preferente TEXT NOT NULL,
-                    dias_matutino TEXT,
-                    dias_vespertino TEXT
-                );
-            """)
-            cursor_h.execute("""
-                CREATE TABLE IF NOT EXISTS materia (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    nombre TEXT NOT NULL,
-                    tipo TEXT NOT NULL
-                );
-            """)
-            cursor_h.execute("""
-                CREATE TABLE IF NOT EXISTS cargaacademica (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    docente_id INTEGER NOT NULL,
-                    seccion_id INTEGER NOT NULL,
-                    materia_id INTEGER NOT NULL,
-                    horas_semanales INTEGER NOT NULL
-                );
-            """)
-            cursor_h.execute("""
-                CREATE TABLE IF NOT EXISTS horario (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    seccion_id INTEGER NOT NULL,
-                    docente_id INTEGER NOT NULL,
-                    materia_id INTEGER NOT NULL,
-                    dia TEXT NOT NULL,
-                    bloque_id INTEGER NOT NULL,
-                    hora_texto TEXT NOT NULL,
-                    origen TEXT DEFAULT 'generado'
-                );
-            """)
-            cursor_h.execute("""
-                CREATE TABLE IF NOT EXISTS estudiante (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    nie TEXT,
-                    nombre TEXT NOT NULL,
-                    grado TEXT NOT NULL,
-                    seccion TEXT NOT NULL
-                );
-            """)
-            conn_h.commit()
+            class SafeCompatCursor:
+                def __init__(self, conn, real_cursor, is_sqlite_db):
+                    self.conn = conn
+                    self.cursor = real_cursor
+                    self.is_sqlite = is_sqlite_db
+                    self.lastrowid = None
+
+                def execute(self, query, params=None):
+                    q = query
+                    if not self.is_sqlite:
+                        # En PostgreSQL se usa %s en vez de ?
+                        # Si es un INSERT y necesitamos lastrowid, agregamos RETURNING id si no está
+                        if "%" not in q and "?" in q:
+                            q = q.replace("?", "%s")
+                        
+                        is_insert = q.strip().upper().startswith("INSERT INTO")
+                        if is_insert and "RETURNING" not in q.upper() and "docente (" in q.lower():
+                            q = q.rstrip("; ") + " RETURNING id;"
+
+                    if params:
+                        res = self.cursor.execute(q, params)
+                    else:
+                        res = self.cursor.execute(q)
+
+                    if not self.is_sqlite:
+                        if q.strip().upper().startswith("INSERT") and "RETURNING" in q.upper():
+                            try:
+                                row = self.cursor.fetchone()
+                                if row:
+                                    self.lastrowid = row[0]
+                            except Exception:
+                                pass
+                    else:
+                        self.lastrowid = getattr(self.cursor, "lastrowid", None)
+                    return res
+
+                def fetchone(self):
+                    return self.cursor.fetchone()
+
+                def fetchall(self):
+                    return self.cursor.fetchall()
+
+                def __getattr__(self, name):
+                    return getattr(self.cursor, name)
+
+            class SafeCompatConn:
+                def __init__(self, raw_c, is_sqlite_db):
+                    self.raw_c = raw_c
+                    self.is_sqlite = is_sqlite_db
+
+                def cursor(self):
+                    return SafeCompatCursor(self.raw_c, self.raw_c.cursor(), self.is_sqlite)
+
+                def commit(self):
+                    return self.raw_c.commit()
+
+                def rollback(self):
+                    return self.raw_c.rollback()
+
+                def close(self):
+                    return self.raw_c.close()
+
+                def cursor_direct(self):
+                    return self.raw_c.cursor()
+
+                def __getattr__(self, name):
+                    return getattr(self.raw_c, name)
+
+            conn_h = SafeCompatConn(raw_conn, is_sqlite)
+            cursor_h = conn_h.cursor()
 
             # --- PARCHE QUIRÚRGICO: Asegurar columnas de días en la tabla docente ---
             try:
                 cursor_h.execute("ALTER TABLE docente ADD COLUMN dias_matutino TEXT;")
                 conn_h.commit()
             except Exception:
-                pass
+                conn_h.rollback()
 
             try:
                 cursor_h.execute("ALTER TABLE docente ADD COLUMN dias_vespertino TEXT;")
                 conn_h.commit()
             except Exception:
-                pass
+                conn_h.rollback()
 
             try:
                 cursor_h.execute("ALTER TABLE horario ADD COLUMN origen TEXT DEFAULT 'generado';")
                 conn_h.commit()
             except Exception:
-                pass
+                conn_h.rollback()
             # ------------------------------------------------------------------------
 
             # Reducido a 4 pestañas limpias y funcionales
@@ -1433,7 +1443,7 @@ if current_user.role == "Admin":
                     st.info("No hay secciones disponibles para eliminar.")
 
                 st.divider()
-                df_secciones = pd.read_sql("SELECT * FROM seccion", conn_h)
+                df_secciones = pd.read_sql("SELECT * FROM seccion", raw_conn)
                 if not df_secciones.empty:
                     st.dataframe(df_secciones, width='stretch')
                 else:
@@ -1488,7 +1498,7 @@ if current_user.role == "Admin":
                             st.info("No hay materias disponibles para eliminar.")
 
                         st.divider()
-                        df_mat = pd.read_sql("SELECT * FROM materia", conn_h)
+                        df_mat = pd.read_sql("SELECT * FROM materia", raw_conn)
                         if not df_mat.empty:
                             st.dataframe(df_mat, width='stretch')
                         else:

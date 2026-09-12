@@ -253,6 +253,74 @@ def init_db():
         except Exception:
             conn.rollback()
 
+        # Tablas del módulo de horarios sincronizadas nativamente en la base de datos
+        serial_type = "SERIAL" if not DB_URL.startswith("sqlite") else "INTEGER"
+        autoincrement_str = "AUTOINCREMENT" if DB_URL.startswith("sqlite") else ""
+        
+        tablas_horarios = [
+            f"""
+            CREATE TABLE IF NOT EXISTS seccion (
+                id {serial_type} PRIMARY KEY {autoincrement_str},
+                nombre VARCHAR(100) NOT NULL,
+                modalidad VARCHAR(150) NOT NULL,
+                anio VARCHAR(50) NOT NULL
+            );
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS docente (
+                id {serial_type} PRIMARY KEY {autoincrement_str},
+                nombre VARCHAR(150) NOT NULL,
+                correo_institucional VARCHAR(150) NOT NULL,
+                turno_preferente VARCHAR(50) NOT NULL,
+                dias_matutino TEXT,
+                dias_vespertino TEXT
+            );
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS materia (
+                id {serial_type} PRIMARY KEY {autoincrement_str},
+                nombre VARCHAR(150) NOT NULL,
+                tipo VARCHAR(50) NOT NULL
+            );
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS cargaacademica (
+                id {serial_type} PRIMARY KEY {autoincrement_str},
+                docente_id INTEGER NOT NULL,
+                seccion_id INTEGER NOT NULL,
+                materia_id INTEGER NOT NULL,
+                horas_semanales INTEGER NOT NULL
+            );
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS horario (
+                id {serial_type} PRIMARY KEY {autoincrement_str},
+                seccion_id INTEGER NOT NULL,
+                docente_id INTEGER NOT NULL,
+                materia_id INTEGER NOT NULL,
+                dia VARCHAR(20) NOT NULL,
+                bloque_id INTEGER NOT NULL,
+                hora_texto VARCHAR(50) NOT NULL,
+                origen VARCHAR(20) DEFAULT 'generado'
+            );
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS estudiante (
+                id {serial_type} PRIMARY KEY {autoincrement_str},
+                nie VARCHAR(50),
+                nombre VARCHAR(150) NOT NULL,
+                grado VARCHAR(50) NOT NULL,
+                seccion VARCHAR(50) NOT NULL
+            );
+            """
+        ]
+        for sql_t in tablas_horarios:
+            try:
+                conn.execute(text(sql_t))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+
     # --- Migrar contraseñas viejas en texto plano a hash bcrypt ---
     # (Corre una sola vez por cuenta: si ya está hasheada, se deja intacta.)
     usuarios_sin_hashear = [u for u in session.query(User).all() if not es_hash_bcrypt(u.password)]
@@ -314,3 +382,17 @@ def init_db():
 def get_session():
     Session = sessionmaker(bind=engine)
     return Session()
+
+
+def get_raw_connection():
+    """Devuelve una conexión compatible DB-API nativa para consultas SQL directas
+    (funciona tanto con SQLite como con PostgreSQL psycopg2)."""
+    if DB_URL.startswith("sqlite"):
+        import sqlite3
+        import os
+        os.makedirs("modulo_horarios", exist_ok=True)
+        return sqlite3.connect("modulo_horarios/database.db")
+    else:
+        import psycopg2
+        # Conectar a PostgreSQL Neon directamente
+        return psycopg2.connect(DB_URL)
